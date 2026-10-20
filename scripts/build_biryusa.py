@@ -10,14 +10,36 @@ import math
 import re
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pdfplumber
+import openpyxl
 from PIL import Image
+from geotiff_layer import export_geotiff
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT.parents[1] / '2025_Бирюса'
 MAPS = SOURCE / 'Maps'
+REGISTER = ROOT.parent / 'игарка_реестр.xlsx'
+ROCK_GROUPS = {
+    'mafic': ('Базитовые породы', {17,18,22,26,28,29,30,33}),
+    'metamorphic': ('Метаморфические породы', {19,20,24,31}),
+    'granite': ('Граниты', {21,25,27,32}),
+    'sandstone': ('Песчаники · шангулежская свита, низы карагасской серии', {23}),
+}
+
+
+def classify_rock(sample):
+    """Explicit sample groups supplied by the project owner, not text inference."""
+    if sample.startswith('BR24-'):
+        return 'mafic', ROCK_GROUPS['mafic'][0]
+    if sample.startswith('SM25-'):
+        number = int(sample.split('-')[1].split('/')[0])
+        for group, (label, numbers) in ROCK_GROUPS.items():
+            if number in numbers:
+                return group, label
+    return 'unclassified', 'Не классифицировано'
 
 
 def clean(value):
@@ -61,10 +83,61 @@ def load_samples():
                             'source_url':'data/catalog_'+str(year)+'.pdf#page=1'})
         shutil.copyfile(path, ROOT / 'data' / ('catalog_'+str(year)+'.pdf'))
     assert len({s['sample'] for s in samples}) == len(samples)
+    samples = merge_register(samples)
+    for sample in samples:
+        sample['rock_type'], sample['rock_label'] = classify_rock(sample['sample'])
     (ROOT/'data'/'samples.json').write_text(json.dumps(samples, ensure_ascii=False, indent=2),encoding='utf-8')
     with (ROOT/'data'/'samples.csv').open('w',encoding='utf-8-sig',newline='') as output:
         writer=csv.DictWriter(output,fieldnames=list(samples[0]));writer.writeheader();writer.writerows(samples)
     return samples
+
+
+def merge_register(samples):
+    """A:E only: registry is authoritative; PDF notes remain historical context."""
+    by_id = {s['sample']:s for s in samples}
+    for s in samples:
+        s.update(done='',plan='',registry_source='',registry_sheet='',registry_row=None,
+                 coordinate_source=s['source'],catalog_description=s['description'])
+    with closing(openpyxl.load_workbook(REGISTER,read_only=True,data_only=True)) as workbook:
+        sheet = workbook['Biryusa']
+        rows = sheet.iter_rows(min_row=2,max_col=5,values_only=True)
+        header = next(rows)
+        assert header[3:5] == ('Сделано','План'), header
+        seen = set()
+        for row, values in enumerate(rows,3):
+            sample, position, description, done, plan = values
+            if not sample:
+                continue
+            sample = clean(str(sample))
+            match = re.fullmatch(r'(?:BR|SM)(\d{2})-\d+(?:/\d+)?',sample)
+            assert match, (row,sample)
+            assert sample not in seen, ('Duplicate registry sample',sample)
+            seen.add(sample)
+            lat,lon = coordinates(str(position))
+            if sample not in by_id:
+                s = {'sample':sample,'point_id':sample.split('/')[0],
+                     'year':2000+int(match.group(1)), 'analysis':'','description':'',
+                     'campaign_note':'','source':'','source_page':None,'source_url':'',
+                     'catalog_description':''}
+                samples.append(s)
+                by_id[sample] = s
+            s = by_id[sample]
+            s.update(lat=lat,lon=lon,position_raw=str(position).strip(),
+                     done=str(done).strip() if done is not None else '',
+                     plan=str(plan).strip() if plan is not None else '',
+                     registry_source=REGISTER.name,registry_sheet='Biryusa',registry_row=row,
+                     coordinate_source=f'{REGISTER.name} · Biryusa!B{row}')
+            if description is not None and str(description).strip():
+                s['description'] = str(description).strip()
+        # Subsamples stay at their parent point, but never inherit its analyses.
+        for s in samples:
+            if s['sample'] not in seen and '/' in s['sample']:
+                parent = by_id.get(s['point_id'])
+                if parent and parent['registry_row']:
+                    for key in ('lat','lon','position_raw','coordinate_source'):
+                        s[key] = parent[key]
+    assert len(by_id) == len(samples)
+    return sorted(samples,key=lambda s:(s['year'],int(s['point_id'].split('-')[1]),s['sample']))
 
 
 def database(path):
@@ -122,6 +195,7 @@ def main():
         export_layer('n47ix','N-47-IX · геологическая карта',[MAPS/'N-47-IX'/'N-47-IX.mbtiles'],enabled=True),
         export_layer('n47xv','N-47-XV · геологическая карта',[MAPS/'N-47-XV'/'N-47-XV.mbtiles'],enabled=True),
         export_layer('field2025','Полевой комплект 2025',[MAPS/'ГеолКарта_2025_1.sqlitedb',MAPS/'ГеолКарта_2025.sqlitedb']),
+        export_geotiff(ROOT, SOURCE, MAPS/'Biryusa_2025_geotif.tif'),
     ]
     template=(ROOT/'scripts'/'portal_template.html').read_text(encoding='utf-8')
     html=template.replace('__SAMPLES__',json.dumps(samples,ensure_ascii=False,separators=(',',':')))
